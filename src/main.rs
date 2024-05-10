@@ -10,6 +10,7 @@ use pnet::{
     },
     transport::{self, TransportChannelType},
 };
+use std::collections::HashSet;
 use std::error::Error;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
@@ -30,10 +31,11 @@ struct Args {
     port: u16,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 struct Connection {
     backend: Ipv4Addr,
     client: Ipv4Addr,
+    lb: Ipv4Addr,
     port_mapper: (u16, u16),
 }
 
@@ -74,7 +76,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let listener = TcpListener::bind(format!("0.0.0.0:{}", args.port))?;
     let mut adders = args.adders.iter().cycle();
-    let mut connections_pool: Vec<Connection> = Vec::new();
+    let mut connections_pool: HashSet<Connection> = HashSet::new();
 
     println!("listening on :{}...", args.port);
 
@@ -87,11 +89,11 @@ fn main() -> Result<()> {
 
     // TODO: support for ipv6
     // TODO: if backend is on the same server as lb this will create's a loop
-    while let Ok((ipv4_packet, ip_adder)) = packets_iter.next() {
-        let ip_adder = match ip_adder {
-            IpAddr::V4(ip_adder) => ip_adder,
-            IpAddr::V6(_) => todo!(),
-        };
+    while let Ok((ipv4_packet, _)) = packets_iter.next() {
+        // let ip_adder = match ip_adder {
+        //     IpAddr::V4(ip_adder) => ip_adder,
+        //     IpAddr::V6(_) => todo!(),
+        // };
         let mut tcp_packet = MutableTcpPacket::owned(ipv4_packet.payload().to_vec()).unwrap();
         let mut ipv4_packet = MutableIpv4Packet::owned(ipv4_packet.packet().to_vec()).unwrap();
 
@@ -117,13 +119,13 @@ fn main() -> Result<()> {
                     // .find(|ip| IpAddr::V4(ip.backend) == ipv4_packet.get_source() || ip.port_mapper == (tcp_packet.get_destination(), 8000))
                     .expect("couldn't find the port mapper on connections pool");
 
-                ipv4_packet.set_source(Ipv4Addr::new(10, 5, 0, 6));
+                ipv4_packet.set_source(connection.lb);
                 ipv4_packet.set_destination(connection.client);
                 tcp_packet.set_source(args.port);
                 tcp_packet.set_destination(connection.port_mapper.0);
                 tcp_packet.set_checksum(tcp::ipv4_checksum(
                     &tcp_packet.to_immutable(),
-                    &Ipv4Addr::new(10, 5, 0, 6),
+                    &connection.lb,
                     &connection.client,
                 ));
                 ipv4_packet.set_payload(tcp_packet.packet());
@@ -139,10 +141,17 @@ fn main() -> Result<()> {
 
             let backend = adders.next().unwrap();
 
-            let connection = Connection {
-                backend: *backend.ip(),
-                port_mapper: (tcp_packet.get_source(), backend.port()),
-                client: ipv4_packet.get_source(),
+            let connection = {
+                connections_pool
+                    .iter()
+                    .find(|ip| ip.port_mapper.0 == tcp_packet.get_source())
+                    .map(|ip| ip.clone())
+                    .unwrap_or(Connection {
+                        backend: *backend.ip(),
+                        lb: ipv4_packet.get_destination(),
+                        client: ipv4_packet.get_source(),
+                        port_mapper: (tcp_packet.get_source(), backend.port()),
+                    })
             };
 
             println!("found a packet with that port!");
@@ -153,16 +162,15 @@ fn main() -> Result<()> {
                 ipv4_packet.get_destination(),
                 tcp_packet.get_destination(),
             );
-            // println!("{:?}", get_local_ip());
 
-            ipv4_packet.set_source(Ipv4Addr::new(10, 5, 0, 6));
-            ipv4_packet.set_destination(*backend.ip());
+            ipv4_packet.set_source(connection.lb);
+            ipv4_packet.set_destination(connection.backend);
             tcp_packet.set_source(args.port);
             tcp_packet.set_destination(backend.port());
             tcp_packet.set_checksum(tcp::ipv4_checksum(
                 &tcp_packet.to_immutable(),
-                &Ipv4Addr::new(10, 5, 0, 6),
-                &backend.ip(),
+                &connection.lb,
+                &connection.backend,
             ));
             ipv4_packet.set_payload(tcp_packet.packet());
             ipv4_packet.set_checksum(ipv4::checksum(&ipv4_packet.to_immutable()));
@@ -175,13 +183,12 @@ fn main() -> Result<()> {
                 tcp_packet.get_destination(),
             );
 
-            println!("{:?}", backend.ip());
             println!(
                 "send {:?} to backend",
                 sender.send_to(ipv4_packet, IpAddr::V4(*backend.ip()))?
             );
-            println!("{:?}", &connection);
-            connections_pool.push(connection);
+            connections_pool.insert(connection);
+            println!("{:?}", &connections_pool);
         }
     }
     Ok(())
